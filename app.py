@@ -1,3 +1,4 @@
+from urllib.parse import quote
 import os, json, re, time, asyncio, tempfile, requests, threading, subprocess, shutil
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
@@ -49,9 +50,10 @@ def script_prompt(niche, topic, n, voice):
     lang = "Tamil" if voice.startswith("ta") else "Hindi" if voice.startswith("hi") else "English"
     return (f"Create a YouTube Short in the niche '{niche}'. Topic: {topic or 'pick a fresh, surprising topic'}. "
             f"Narration language: {lang}. Exactly {n} scenes. Scene 1 is a strong hook. Each scene: 1-2 short "
-            "sentences of narration and 2-3 English stock-footage search keywords (visual things like 'ocean waves'). "
+            "sentences of narration, 2-3 English stock-footage search keywords (visual things like 'ocean waves'), and an "
+            "image_prompt: a vivid English description of the picture for that scene (subject, setting, lighting, no text). "
             'Reply ONLY with JSON: {"title": "...", "description": "... with hashtags", '
-            '"scenes": [{"narration": "...", "keywords": "..."}]}')
+            '"scenes": [{"narration": "...", "keywords": "...", "image_prompt": "..."}]}')
 
 
 def get_script_gemini(niche, topic, n, voice, key):
@@ -175,16 +177,62 @@ def fetch_pixabay(query, key, folder, used, errs, vtype="all", W=720):
     return None
 
 
-def fit_clip(src, dst, dur, W, H):
-    """Loop, trim, scale and crop a clip to exactly W x H with native ffmpeg (much faster than moviepy)."""
+def run_ff(args):
     exe = shutil.which("ffmpeg")
     if not exe:
         import imageio_ffmpeg
         exe = imageio_ffmpeg.get_ffmpeg_exe()
-    subprocess.run([exe, "-y", "-stream_loop", "-1", "-i", src, "-t", f"{dur:.2f}", "-vf",
-                    f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=24",
-                    "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p", dst],
-                   check=True, capture_output=True, timeout=300)
+    p = subprocess.run([exe, "-y"] + args, capture_output=True, text=True, timeout=300)
+    if p.returncode != 0:
+        raise RuntimeError("ffmpeg: " + p.stderr[-200:])
+
+
+def fit_clip(src, dst, dur, W, H):
+    """Loop, trim, scale and crop a clip to exactly W x H with native ffmpeg (much faster than moviepy)."""
+    run_ff(["-stream_loop", "-1", "-i", src, "-t", f"{dur:.2f}", "-vf",
+            f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=24",
+            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p", dst])
+
+
+def ken_burns(img, dst, dur, W, H, idx=0):
+    """Turn a still image into a slowly zooming video clip (alternates zoom in / zoom out)."""
+    frames = max(2, int(dur * 24))
+    inc = 0.25 / frames
+    big_w, big_h = int(W * 1.5) // 2 * 2, int(H * 1.5) // 2 * 2
+    z = f"min(zoom+{inc:.6f},1.25)" if idx % 2 == 0 else f"if(lte(zoom,1.0),1.25,max(1.0,zoom-{inc:.6f}))"
+    run_ff(["-i", img, "-vf",
+            f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase,crop={big_w}:{big_h},"
+            f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps=24,format=yuv420p",
+            "-frames:v", str(frames), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", dst])
+
+
+IMG_LOCK, IMG_LAST = threading.Lock(), [0.0]
+
+
+def gen_image(prompt, W, H, seed, folder, errs):
+    """Free AI image from Pollinations (no key). Anonymous use is rate limited, so requests are spaced and retried."""
+    rw, rh = (W, H) if W < 720 else (720, 1280)
+    url = "https://image.pollinations.ai/prompt/" + quote(prompt[:600])
+    for attempt in range(4):
+        with IMG_LOCK:
+            wait = 12 - (time.time() - IMG_LAST[0])
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                r = requests.get(url, timeout=120, params={"width": rw, "height": rh, "seed": seed + attempt,
+                                                           "nologo": "true", "model": "flux"})
+            except Exception as e:
+                IMG_LAST[0] = time.time()
+                errs.append(f"AI image request failed: {e}")
+                continue
+            IMG_LAST[0] = time.time()
+        if r.status_code == 200 and r.headers.get("content-type", "").startswith("image") and len(r.content) > 5000:
+            path = os.path.join(folder, f"ai{seed}.jpg")
+            with open(path, "wb") as fh:
+                fh.write(r.content)
+            return path
+        errs.append(f"AI image service replied {r.status_code}")
+    return None
 
 
 def load_font(size, text=""):
@@ -229,13 +277,14 @@ def caption(text, dur, W=W, H=H):
     return ImageClip(np.array(img)).set_duration(dur).set_position((0, y0))
 
 
-def build(scenes, pexels_key, voice, captions, out, log, errs, mod=(0, 0, 0), size=(1080, 1920), vtype="all"):
+def build(scenes, pexels_key, voice, captions, out, log, errs, mod=(0, 0, 0), size=(1080, 1920), vtype="all",
+          visuals="stock", img_style=""):
     W, H = size
     tmp, used = tempfile.mkdtemp(), set()
     pix = secret("PIXABAY_API_KEY")
     if vtype == "animation" and not pix:
         errs.append("Animation style needs PIXABAY_API_KEY in Secrets")
-    if not pexels_key and not pix:
+    if not pexels_key and not pix and visuals != "ai":
         errs.append("No PEXELS_API_KEY or PIXABAY_API_KEY found in Secrets")
 
     def prep(i, s):
@@ -244,18 +293,29 @@ def build(scenes, pexels_key, voice, captions, out, log, errs, mod=(0, 0, 0), si
         a = AudioFileClip(mp3)
         dur = a.duration + 0.3
         a.close()
-        q = s["keywords"] if s["keywords"].isascii() else "nature landscape"
-        path = fetch_clip(q, pexels_key, tmp, used, errs, H) if pexels_key and vtype != "animation" else None
-        if not path and pix:
-            path = fetch_pixabay(q, pix, tmp, used, errs, vtype, W)
         fitted = None
-        if path:
-            try:
-                fitted = os.path.join(tmp, f"f{i}.mp4")
-                fit_clip(path, fitted, dur, W, H)
-            except Exception as e:
-                errs.append(f"Video resize failed: {e}")
-                fitted = None
+        if visuals == "ai":
+            prompt = f'{s.get("image_prompt") or s["keywords"]}, {img_style}, vertical composition, no text, no watermark'
+            img = gen_image(prompt, W, H, int(time.time()) % 100000 + i * 7, tmp, errs)
+            if img:
+                try:
+                    fitted = os.path.join(tmp, f"f{i}.mp4")
+                    ken_burns(img, fitted, dur, W, H, i)
+                except Exception as e:
+                    errs.append(f"Image animation failed: {e}")
+                    fitted = None
+        if not fitted:
+            q = s["keywords"] if s["keywords"].isascii() else "nature landscape"
+            path = fetch_clip(q, pexels_key, tmp, used, errs, H) if pexels_key and vtype != "animation" else None
+            if not path and pix:
+                path = fetch_pixabay(q, pix, tmp, used, errs, vtype, W)
+            if path:
+                try:
+                    fitted = os.path.join(tmp, f"f{i}.mp4")
+                    fit_clip(path, fitted, dur, W, H)
+                except Exception as e:
+                    errs.append(f"Video resize failed: {e}")
+                    fitted = None
         return mp3, dur, fitted
 
     log(f"Preparing {len(scenes)} scenes in parallel...")
@@ -283,7 +343,9 @@ gemini_key = secret("GEMINI_API_KEY")
 if not pexels_key and not secret("PIXABAY_API_KEY"):
     st.warning("No video key found (PIXABAY_API_KEY or PEXELS_API_KEY), so videos will have a plain dark background. Add one in app Settings > Secrets.")
 
-niche = st.selectbox("Niche", NICHES)
+niche = st.selectbox("Niche", NICHES + ["Other (type my own)"])
+if niche.startswith("Other"):
+    niche = st.text_input("Your own niche", placeholder="e.g. space facts, fitness tips, Tamil history") or "Amazing facts"
 topic = st.text_input("Topic (optional)", placeholder="Leave empty and AI picks one")
 lang_pick = st.radio("Voice language", ["Tamil", "English", "Hindi"], horizontal=True)
 code = {"Tamil": "ta", "English": "en", "Hindi": "hi"}[lang_pick]
@@ -314,7 +376,16 @@ n = c1.slider("Scenes", 3, 8, 5)
 caps = c2.checkbox("Captions", True)
 quality = st.selectbox("Video quality (MP4)", list(QUALITY), index=1)
 VTYPE = {"Real footage": "film", "Animation / cartoon": "animation", "Any": "all"}
-style = st.selectbox("Video style", list(VTYPE))
+visuals = st.radio("Visuals", ["Stock video", "AI images (free, slower)"], horizontal=True)
+IMG_STYLES = {"Cinematic realistic": "cinematic, photorealistic, dramatic lighting, 4k",
+              "Cartoon / animation": "colorful cartoon animation style, bold outlines, vibrant",
+              "Anime": "anime style, detailed, vibrant colors", "3D render": "3D render, pixar style, soft lighting",
+              "Dark mystery": "dark moody atmosphere, mysterious, fog, cinematic",
+              "Watercolor": "watercolor painting, soft pastel colors"}
+if visuals.startswith("AI"):
+    img_style, style = st.selectbox("AI image style", list(IMG_STYLES)), "Real footage"
+else:
+    img_style, style = None, st.selectbox("Video style", list(VTYPE))
 manual = st.text_area("Or paste your own script", placeholder="One scene per line: narration | keywords")
 
 if st.button("Generate video", type="primary", use_container_width=True):
@@ -333,7 +404,8 @@ if st.button("Generate video", type="primary", use_container_width=True):
                 st.stop()
             out = os.path.join(tempfile.mkdtemp(), "short.mp4")
             errs = []
-            missed = build(data["scenes"], pexels_key, choices[voice_name], caps, out, status.write, errs, mod, QUALITY[quality], VTYPE[style])
+            missed = build(data["scenes"], pexels_key, choices[voice_name], caps, out, status.write, errs, mod, QUALITY[quality], VTYPE[style],
+                           "ai" if visuals.startswith("AI") else "stock", IMG_STYLES.get(img_style, ""))
             if not missed:
                 errs = []
             status.update(label="Done", state="complete")
