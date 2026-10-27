@@ -4,5 +4,4 @@ gTTS
 edge-tts
 requests
 moviepy==1.0.3
-Pillow==9.5.0
-numpy<2
+opencv-python-headless
