@@ -81,6 +81,31 @@ def fetch_clip(query, key, folder, used, errs):
     return None
 
 
+def fetch_pixabay(query, key, folder, used, errs):
+    try:
+        key = key.strip().strip('"').strip("'")
+        resp = requests.get("https://pixabay.com/api/videos/", timeout=20,
+                            params={"key": key, "q": query[:90], "per_page": 15, "safesearch": "true"})
+        if resp.status_code != 200:
+            errs.append(f"Pixabay replied {resp.status_code}: {resp.text[:120]}")
+            return None
+        for h in resp.json().get("hits", []):
+            if ("px", h["id"]) in used:
+                continue
+            vids = h.get("videos", {})
+            f = next((vids[k] for k in ("large", "medium", "small") if vids.get(k, {}).get("url")), None)
+            if f:
+                used.add(("px", h["id"]))
+                path = os.path.join(folder, f"px{h['id']}.mp4")
+                with open(path, "wb") as fh:
+                    fh.write(requests.get(f["url"], timeout=90).content)
+                return path
+        errs.append(f"No Pixabay results for '{query}'")
+    except Exception as e:
+        errs.append(f"Pixabay request failed: {e}")
+    return None
+
+
 def load_font(size, text=""):
     fonts = (TAMIL_FONTS if re.search(r"[\u0B80-\u0BFF]", text) else []) + FONTS
     try:
@@ -118,8 +143,8 @@ def caption(text, dur):
 
 def build(scenes, pexels_key, voice, captions, out, log, errs):
     tmp, clips, used, missed = tempfile.mkdtemp(), [], set(), 0
-    if not pexels_key:
-        errs.append("PEXELS_API_KEY not found in Secrets")
+    if not pexels_key and not secret("PIXABAY_API_KEY"):
+        errs.append("No PEXELS_API_KEY or PIXABAY_API_KEY found in Secrets")
     for i, s in enumerate(scenes):
         log(f"Scene {i + 1}/{len(scenes)}: voice and footage...")
         mp3 = os.path.join(tmp, f"v{i}.mp3")
@@ -128,6 +153,8 @@ def build(scenes, pexels_key, voice, captions, out, log, errs):
         dur = audio.duration + 0.3
         q = s["keywords"] if s["keywords"].isascii() else "nature landscape"
         path = fetch_clip(q, pexels_key, tmp, used, errs) if pexels_key else None
+        if not path and secret("PIXABAY_API_KEY"):
+            path = fetch_pixabay(q, secret("PIXABAY_API_KEY"), tmp, used, errs)
         if path:
             v = VideoFileClip(path).without_audio()
             v = v.fx(vfx.loop, duration=dur) if v.duration < dur else v.subclip(0, dur)
@@ -147,8 +174,8 @@ def build(scenes, pexels_key, voice, captions, out, log, errs):
 st.set_page_config(page_title="AutoShort AI", page_icon="🎬", layout="centered")
 st.title("🎬 AutoShort AI")
 claude_key, pexels_key = secret("ANTHROPIC_API_KEY"), secret("PEXELS_API_KEY")
-if not pexels_key:
-    st.warning("PEXELS_API_KEY is missing, so videos will have a plain dark background. Add it in app Settings > Secrets.")
+if not pexels_key and not secret("PIXABAY_API_KEY"):
+    st.warning("No video key found (PIXABAY_API_KEY or PEXELS_API_KEY), so videos will have a plain dark background. Add one in app Settings > Secrets.")
 
 niche = st.selectbox("Niche", NICHES)
 topic = st.text_input("Topic (optional)", placeholder="Leave empty and AI picks one")
@@ -172,6 +199,8 @@ if st.button("Generate video", type="primary", use_container_width=True):
             out = os.path.join(tempfile.mkdtemp(), "short.mp4")
             errs = []
             missed = build(data["scenes"], pexels_key, VOICES[voice_name], caps, out, status.write, errs)
+            if not missed:
+                errs = []
             status.update(label="Done", state="complete")
         st.session_state.update(video=open(out, "rb").read(), data=data, missed=missed, errs=errs)
     except Exception as e:
