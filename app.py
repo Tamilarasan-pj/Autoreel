@@ -55,22 +55,29 @@ def tts(text, voice, path):
         gTTS(text, lang=voice[:2]).save(path)
 
 
-def fetch_clip(query, key, folder, used):
+def fetch_clip(query, key, folder, used, errs):
     try:
-        r = requests.get("https://api.pexels.com/videos/search", headers={"Authorization": key},
-                         params={"query": query, "orientation": "portrait", "per_page": 10}, timeout=20).json()
-        for v in r.get("videos", []):
+        key = key.strip().strip('"').strip("'")
+        resp = requests.get("https://api.pexels.com/videos/search", headers={"Authorization": key},
+                            params={"query": query, "orientation": "portrait", "per_page": 10}, timeout=20)
+        if resp.status_code != 200:
+            errs.append(f"Pexels replied {resp.status_code}: {resp.text[:120]}")
+            return None
+        for v in resp.json().get("videos", []):
             if v["id"] in used:
                 continue
-            files = sorted([f for f in v["video_files"] if f.get("height", 0) >= 1280], key=lambda f: f["height"])
-            if files:
+            files = sorted([f for f in v["video_files"] if f.get("file_type") == "video/mp4"],
+                           key=lambda f: f.get("height", 0))
+            good = [f for f in files if f.get("height", 0) >= 1280] or files[-1:]
+            if good:
                 used.add(v["id"])
                 path = os.path.join(folder, f"{v['id']}.mp4")
                 with open(path, "wb") as fh:
-                    fh.write(requests.get(files[0]["link"], timeout=90).content)
+                    fh.write(requests.get(good[0]["link"], timeout=90).content)
                 return path
-    except Exception:
-        pass
+        errs.append(f"No Pexels results for '{query}'")
+    except Exception as e:
+        errs.append(f"Pexels request failed: {e}")
     return None
 
 
@@ -109,8 +116,10 @@ def caption(text, dur):
     return ImageClip(np.array(img)).set_duration(dur)
 
 
-def build(scenes, pexels_key, voice, captions, out, log):
+def build(scenes, pexels_key, voice, captions, out, log, errs):
     tmp, clips, used, missed = tempfile.mkdtemp(), [], set(), 0
+    if not pexels_key:
+        errs.append("PEXELS_API_KEY not found in Secrets")
     for i, s in enumerate(scenes):
         log(f"Scene {i + 1}/{len(scenes)}: voice and footage...")
         mp3 = os.path.join(tmp, f"v{i}.mp3")
@@ -118,7 +127,7 @@ def build(scenes, pexels_key, voice, captions, out, log):
         audio = AudioFileClip(mp3)
         dur = audio.duration + 0.3
         q = s["keywords"] if s["keywords"].isascii() else "nature landscape"
-        path = fetch_clip(q, pexels_key, tmp, used) if pexels_key else None
+        path = fetch_clip(q, pexels_key, tmp, used, errs) if pexels_key else None
         if path:
             v = VideoFileClip(path).without_audio()
             v = v.fx(vfx.loop, duration=dur) if v.duration < dur else v.subclip(0, dur)
@@ -161,9 +170,10 @@ if st.button("Generate video", type="primary", use_container_width=True):
                 st.error("No ANTHROPIC_API_KEY found. Paste your own script instead.")
                 st.stop()
             out = os.path.join(tempfile.mkdtemp(), "short.mp4")
-            missed = build(data["scenes"], pexels_key, VOICES[voice_name], caps, out, status.write)
+            errs = []
+            missed = build(data["scenes"], pexels_key, VOICES[voice_name], caps, out, status.write, errs)
             status.update(label="Done", state="complete")
-        st.session_state.update(video=open(out, "rb").read(), data=data, missed=missed)
+        st.session_state.update(video=open(out, "rb").read(), data=data, missed=missed, errs=errs)
     except Exception as e:
         st.error("Something failed. Send this error to Claude:")
         st.exception(e)
@@ -172,6 +182,8 @@ if "video" in st.session_state:
     d = st.session_state["data"]
     if st.session_state.get("missed"):
         st.info(f"{st.session_state['missed']} scene(s) had no stock clip and use a plain background.")
+        for e in sorted(set(st.session_state.get("errs", []))):
+            st.error(e)
     st.video(st.session_state["video"])
     st.download_button("Download MP4", st.session_state["video"], "short.mp4", "video/mp4", use_container_width=True)
     if d.get("title"):
