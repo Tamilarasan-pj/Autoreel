@@ -14,6 +14,8 @@ VOICES = {"English (Aria, female)": "en-US-AriaNeural", "English (Guy, male)": "
           "Hindi (Swara, female)": "hi-IN-SwaraNeural"}
 NICHES = ["Amazing facts", "Money tips", "History mysteries", "Motivation", "Scary stories", "AI and tech news"]
 FONTS = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "DejaVuSans-Bold.ttf"]
+TAMIL_FONTS = ["/usr/share/fonts/truetype/noto/NotoSansTamil-Bold.ttf",
+               "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf", "NotoSansTamil-Bold.ttf"]
 
 
 def secret(name):
@@ -40,7 +42,7 @@ def parse_manual(text):
     for line in text.strip().splitlines():
         if line.strip():
             narr, _, kw = line.partition("|")
-            scenes.append({"narration": narr.strip(), "keywords": kw.strip() or narr.strip()})
+            scenes.append({"narration": narr.strip(), "keywords": kw.strip() or "nature landscape"})
     return {"title": "", "description": "", "scenes": scenes}
 
 
@@ -72,18 +74,25 @@ def fetch_clip(query, key, folder, used):
     return None
 
 
-def load_font(size):
-    for f in FONTS:
-        try:
-            return ImageFont.truetype(f, size)
-        except Exception:
-            continue
+def load_font(size, text=""):
+    fonts = (TAMIL_FONTS if re.search(r"[\u0B80-\u0BFF]", text) else []) + FONTS
+    try:
+        from PIL import features
+        eng = ImageFont.Layout.RAQM if features.check("raqm") else ImageFont.Layout.BASIC
+    except Exception:
+        eng = None
+    for f in fonts:
+        for kw in ({"layout_engine": eng} if eng is not None else {}, {}):
+            try:
+                return ImageFont.truetype(f, size, **kw)
+            except Exception:
+                continue
     return ImageFont.load_default()
 
 
 def caption(text, dur):
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d, font = ImageDraw.Draw(img), load_font(70)
+    d, font = ImageDraw.Draw(img), load_font(58, text)
     lines, line = [], ""
     for w in text.split():
         t = (line + " " + w).strip()
@@ -93,10 +102,10 @@ def caption(text, dur):
         else:
             line = t
     lines.append(line)
-    y = H - 480 - len(lines) * 45
+    y = 1400 - len(lines) * 40
     for l in lines:
-        d.text(((W - d.textlength(l, font=font)) / 2, y), l, font=font, fill="white", stroke_width=6, stroke_fill="black")
-        y += 90
+        d.text(((W - d.textlength(l, font=font)) / 2, y), l, font=font, fill="white", stroke_width=5, stroke_fill="black")
+        y += 80
     return ImageClip(np.array(img)).set_duration(dur)
 
 
@@ -108,7 +117,8 @@ def build(scenes, pexels_key, voice, captions, out, log):
         tts(s["narration"], voice, mp3)
         audio = AudioFileClip(mp3)
         dur = audio.duration + 0.3
-        path = fetch_clip(s["keywords"], pexels_key, tmp, used) if pexels_key else None
+        q = s["keywords"] if s["keywords"].isascii() else "nature landscape"
+        path = fetch_clip(q, pexels_key, tmp, used) if pexels_key else None
         if path:
             v = VideoFileClip(path).without_audio()
             v = v.fx(vfx.loop, duration=dur) if v.duration < dur else v.subclip(0, dur)

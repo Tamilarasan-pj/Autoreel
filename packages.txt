@@ -1,2 +1,5 @@
 ffmpeg
 fonts-dejavu-core
+fonts-noto-core
+libraqm0
+libfribidi0
