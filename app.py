@@ -1,4 +1,5 @@
-import os, json, re, asyncio, tempfile, requests
+import os, json, re, time, asyncio, tempfile, requests, threading, subprocess, shutil
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import streamlit as st
 import edge_tts
@@ -40,7 +41,8 @@ def secret(name):
         return os.getenv(name, "")
 
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash",
+                 "gemini-flash-latest", "gemini-flash-lite-latest"]
 
 
 def script_prompt(niche, topic, n, voice):
@@ -53,18 +55,35 @@ def script_prompt(niche, topic, n, voice):
 
 
 def get_script_gemini(niche, topic, n, voice, key):
-    prompt, last = script_prompt(niche, topic, n, voice), ""
+    prompt, errors = script_prompt(niche, topic, n, voice), []
     key = key.strip().strip('"').strip("'")
-    for m in GEMINI_MODELS:
-        r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
-                          headers={"x-goog-api-key": key}, timeout=60,
-                          json={"contents": [{"parts": [{"text": prompt}]}],
-                                "generationConfig": {"responseMimeType": "application/json"}})
-        if r.status_code == 200:
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(re.search(r"\{.*\}", text, re.S).group(0))
-        last = f"{m}: {r.status_code} {r.text[:150]}"
-    raise RuntimeError("Gemini failed - " + last)
+    for attempt in range(3):  # busy servers (503/429) are usually temporary, so retry a few times
+        busy = False
+        for m in GEMINI_MODELS:
+            try:
+                r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                                  headers={"x-goog-api-key": key}, timeout=60,
+                                  json={"contents": [{"parts": [{"text": prompt}]}],
+                                        "generationConfig": {"responseMimeType": "application/json"}})
+            except Exception as e:
+                errors.append(f"{m}: {e}")
+                busy = True
+                continue
+            if r.status_code == 200:
+                try:
+                    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    return json.loads(re.search(r"\{.*\}", text, re.S).group(0))
+                except Exception as e:
+                    errors.append(f"{m}: bad reply ({e})")
+                    continue
+            errors.append(f"{m}: {r.status_code}")
+            if r.status_code in (429, 500, 503):
+                busy = True
+        if not busy:
+            break
+        time.sleep(3 * (attempt + 1))
+    raise RuntimeError("Gemini is busy or failed. Wait a minute and try again, or paste your own script. "
+                       "Details: " + ", ".join(errors[-5:]))
 
 
 def get_script(niche, topic, n, voice, key):
@@ -97,7 +116,18 @@ def tts(text, voice, path, rate=0, pitch=0, vol=0):
         gTTS(text, lang=voice[:2]).save(path)
 
 
-def fetch_clip(query, key, folder, used, errs):
+USED_LOCK = threading.Lock()
+
+
+def claim(used, ident):
+    with USED_LOCK:
+        if ident in used:
+            return False
+        used.add(ident)
+        return True
+
+
+def fetch_clip(query, key, folder, used, errs, H=1280):
     try:
         key = key.strip().strip('"').strip("'")
         resp = requests.get("https://api.pexels.com/videos/search", headers={"Authorization": key},
@@ -106,13 +136,10 @@ def fetch_clip(query, key, folder, used, errs):
             errs.append(f"Pexels replied {resp.status_code}: {resp.text[:120]}")
             return None
         for v in resp.json().get("videos", []):
-            if v["id"] in used:
-                continue
             files = sorted([f for f in v["video_files"] if f.get("file_type") == "video/mp4"],
                            key=lambda f: f.get("height", 0))
-            good = [f for f in files if f.get("height", 0) >= 1280] or files[-1:]
-            if good:
-                used.add(v["id"])
+            good = [f for f in files if f.get("height", 0) >= H] or files[-1:]
+            if good and claim(used, v["id"]):
                 path = os.path.join(folder, f"{v['id']}.mp4")
                 with open(path, "wb") as fh:
                     fh.write(requests.get(good[0]["link"], timeout=90).content)
@@ -123,7 +150,9 @@ def fetch_clip(query, key, folder, used, errs):
     return None
 
 
-def fetch_pixabay(query, key, folder, used, errs, vtype="all"):
+def fetch_pixabay(query, key, folder, used, errs, vtype="all", W=720):
+    prefs = ("large", "medium", "small") if W >= 1080 else ("medium", "small", "large") if W >= 720 \
+        else ("small", "medium", "large")
     try:
         key = key.strip().strip('"').strip("'")
         resp = requests.get("https://pixabay.com/api/videos/", timeout=20,
@@ -133,12 +162,9 @@ def fetch_pixabay(query, key, folder, used, errs, vtype="all"):
             errs.append(f"Pixabay replied {resp.status_code}: {resp.text[:120]}")
             return None
         for h in resp.json().get("hits", []):
-            if ("px", h["id"]) in used:
-                continue
             vids = h.get("videos", {})
-            f = next((vids[k] for k in ("large", "medium", "small") if vids.get(k, {}).get("url")), None)
-            if f:
-                used.add(("px", h["id"]))
+            f = next((vids[k] for k in prefs if vids.get(k, {}).get("url")), None)
+            if f and claim(used, ("px", h["id"])):
                 path = os.path.join(folder, f"px{h['id']}.mp4")
                 with open(path, "wb") as fh:
                     fh.write(requests.get(f["url"], timeout=90).content)
@@ -147,6 +173,18 @@ def fetch_pixabay(query, key, folder, used, errs, vtype="all"):
     except Exception as e:
         errs.append(f"Pixabay request failed: {e}")
     return None
+
+
+def fit_clip(src, dst, dur, W, H):
+    """Loop, trim, scale and crop a clip to exactly W x H with native ffmpeg (much faster than moviepy)."""
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run([exe, "-y", "-stream_loop", "-1", "-i", src, "-t", f"{dur:.2f}", "-vf",
+                    f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=24",
+                    "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p", dst],
+                   check=True, capture_output=True, timeout=300)
 
 
 def load_font(size, text=""):
@@ -166,56 +204,74 @@ def load_font(size, text=""):
 
 
 def caption(text, dur, W=W, H=H):
+    """Small caption band instead of a full-frame overlay: much cheaper to composite."""
     k = W / 1080
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d, font = ImageDraw.Draw(img), load_font(max(18, int(58 * k)), text)
+    font = load_font(max(18, int(58 * k)), text)
+    meas = ImageDraw.Draw(Image.new("RGBA", (W, 10)))
     lines, line = [], ""
     for w in text.split():
         t = (line + " " + w).strip()
-        if d.textlength(t, font=font) > W - int(160 * k):
+        if meas.textlength(t, font=font) > W - int(160 * k):
             lines.append(line)
             line = w
         else:
             line = t
     lines.append(line)
-    step = int(80 * k)
-    y = int(H * 0.73) - len(lines) * step // 2
+    step, pad = int(80 * k), int(20 * k)
+    band = len(lines) * step + 2 * pad
+    img = Image.new("RGBA", (W, band), (0, 0, 0, 0))
+    d, y = ImageDraw.Draw(img), pad
     for l in lines:
         d.text(((W - d.textlength(l, font=font)) / 2, y), l, font=font, fill="white",
                stroke_width=max(2, int(5 * k)), stroke_fill="black")
         y += step
-    return ImageClip(np.array(img)).set_duration(dur)
+    y0 = max(0, min(int(H * 0.73) - band // 2, H - band))
+    return ImageClip(np.array(img)).set_duration(dur).set_position((0, y0))
 
 
 def build(scenes, pexels_key, voice, captions, out, log, errs, mod=(0, 0, 0), size=(1080, 1920), vtype="all"):
     W, H = size
-    tmp, clips, used, missed = tempfile.mkdtemp(), [], set(), 0
-    if vtype == "animation" and not secret("PIXABAY_API_KEY"):
+    tmp, used = tempfile.mkdtemp(), set()
+    pix = secret("PIXABAY_API_KEY")
+    if vtype == "animation" and not pix:
         errs.append("Animation style needs PIXABAY_API_KEY in Secrets")
-    if not pexels_key and not secret("PIXABAY_API_KEY"):
+    if not pexels_key and not pix:
         errs.append("No PEXELS_API_KEY or PIXABAY_API_KEY found in Secrets")
-    for i, s in enumerate(scenes):
-        log(f"Scene {i + 1}/{len(scenes)}: voice and footage...")
+
+    def prep(i, s):
         mp3 = os.path.join(tmp, f"v{i}.mp3")
         tts(s["narration"], voice, mp3, *mod)
-        audio = AudioFileClip(mp3)
-        dur = audio.duration + 0.3
+        a = AudioFileClip(mp3)
+        dur = a.duration + 0.3
+        a.close()
         q = s["keywords"] if s["keywords"].isascii() else "nature landscape"
-        path = fetch_clip(q, pexels_key, tmp, used, errs) if pexels_key and vtype != "animation" else None
-        if not path and secret("PIXABAY_API_KEY"):
-            path = fetch_pixabay(q, secret("PIXABAY_API_KEY"), tmp, used, errs, vtype)
+        path = fetch_clip(q, pexels_key, tmp, used, errs, H) if pexels_key and vtype != "animation" else None
+        if not path and pix:
+            path = fetch_pixabay(q, pix, tmp, used, errs, vtype, W)
+        fitted = None
         if path:
-            v = VideoFileClip(path).without_audio()
-            v = v.fx(vfx.loop, duration=dur) if v.duration < dur else v.subclip(0, dur)
-            v = v.resize(max(W / v.w, H / v.h))
-            v = v.crop(x_center=v.w / 2, y_center=v.h / 2, width=W, height=H)
+            try:
+                fitted = os.path.join(tmp, f"f{i}.mp4")
+                fit_clip(path, fitted, dur, W, H)
+            except Exception as e:
+                errs.append(f"Video resize failed: {e}")
+                fitted = None
+        return mp3, dur, fitted
+
+    log(f"Preparing {len(scenes)} scenes in parallel...")
+    with ThreadPoolExecutor(max_workers=min(4, len(scenes))) as ex:
+        results = list(ex.map(lambda a: prep(*a), enumerate(scenes)))
+    clips, missed = [], 0
+    for s, (mp3, dur, fitted) in zip(scenes, results):
+        if fitted:
+            v = VideoFileClip(fitted)
         else:
             missed += 1
             v = ColorClip((W, H), color=(20, 20, 40)).set_duration(dur)
         layers = [v] + ([caption(s["narration"], dur, W, H)] if captions else [])
-        clips.append(CompositeVideoClip(layers, size=(W, H)).set_audio(audio))
-    log("Rendering final video (1 to 3 minutes)...")
-    concatenate_videoclips(clips, method="compose").write_videofile(
+        clips.append(CompositeVideoClip(layers, size=(W, H)).set_audio(AudioFileClip(mp3)))
+    log("Rendering final video...")
+    concatenate_videoclips(clips).write_videofile(
         out, fps=24, codec="libx264", audio_codec="aac", preset="ultrafast", bitrate=BITRATE[W], threads=2, logger=None)
     return missed
 
