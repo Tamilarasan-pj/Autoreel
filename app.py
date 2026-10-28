@@ -187,6 +187,13 @@ def run_ff(args):
         raise RuntimeError("ffmpeg: " + p.stderr[-200:])
 
 
+def get_duration(path):
+    exe = shutil.which("ffprobe") or shutil.which("ffmpeg").replace("ffmpeg", "ffprobe")
+    r = subprocess.run([exe, "-v", "error", "-show_entries", "format=duration",
+                        "-of", "csv=p=0", path], capture_output=True, text=True, timeout=30)
+    return float(r.stdout.strip())
+
+
 def fit_clip(src, dst, dur, W, H):
     """Loop, trim, scale and crop a clip to exactly W x H with native ffmpeg (much faster than moviepy)."""
     run_ff(["-stream_loop", "-1", "-i", src, "-t", f"{dur:.2f}", "-vf",
@@ -196,7 +203,7 @@ def fit_clip(src, dst, dur, W, H):
 
 def ken_burns(img, dst, dur, W, H, idx=0):
     """Turn a still image into a slowly zooming video clip (alternates zoom in / zoom out)."""
-    frames = max(2, int(dur * 24))
+    frames = max(2, round(dur * 24))
     inc = 0.25 / frames
     big_w, big_h = int(W * 1.5) // 2 * 2, int(H * 1.5) // 2 * 2
     z = f"min(zoom+{inc:.6f},1.25)" if idx % 2 == 0 else f"if(lte(zoom,1.0),1.25,max(1.0,zoom-{inc:.6f}))"
@@ -290,9 +297,7 @@ def build(scenes, pexels_key, voice, captions, out, log, errs, mod=(0, 0, 0), si
     def prep(i, s):
         mp3 = os.path.join(tmp, f"v{i}.mp3")
         tts(s["narration"], voice, mp3, *mod)
-        a = AudioFileClip(mp3)
-        dur = a.duration + 0.3
-        a.close()
+        dur = get_duration(mp3) + 0.3  # exact duration from ffprobe to avoid sync drift
         fitted = None
         if visuals == "ai":
             prompt = f'{s.get("image_prompt") or s["keywords"]}, {img_style}, vertical composition, no text, no watermark'
@@ -321,18 +326,32 @@ def build(scenes, pexels_key, voice, captions, out, log, errs, mod=(0, 0, 0), si
     log(f"Preparing {len(scenes)} scenes in parallel...")
     with ThreadPoolExecutor(max_workers=min(4, len(scenes))) as ex:
         results = list(ex.map(lambda a: prep(*a), enumerate(scenes)))
-    clips, missed = [], 0
-    for s, (mp3, dur, fitted) in zip(scenes, results):
+    # Render each scene as its own temp file with audio baked in (fixes sync)
+    scene_files, missed = [], 0
+    for i, (sc, (mp3, dur, fitted)) in enumerate(zip(scenes, results)):
+        log(f"Compositing scene {i+1}/{len(scenes)}...")
         if fitted:
             v = VideoFileClip(fitted)
         else:
             missed += 1
             v = ColorClip((W, H), color=(20, 20, 40)).set_duration(dur)
-        layers = [v] + ([caption(s["narration"], dur, W, H)] if captions else [])
-        clips.append(CompositeVideoClip(layers, size=(W, H)).set_audio(AudioFileClip(mp3)))
-    log("Rendering final video...")
-    concatenate_videoclips(clips).write_videofile(
-        out, fps=24, codec="libx264", audio_codec="aac", preset="ultrafast", bitrate=BITRATE[W], threads=2, logger=None)
+        layers = [v] + ([caption(sc["narration"], dur, W, H)] if captions else [])
+        scene_mp4 = os.path.join(tmp, f"scene{i}.mp4")
+        scene_clip = CompositeVideoClip(layers, size=(W, H))
+        audio_clip = AudioFileClip(mp3)
+        scene_clip = scene_clip.set_audio(audio_clip).set_duration(audio_clip.duration)
+        scene_clip.write_videofile(scene_mp4, fps=24, codec="libx264", audio_codec="aac",
+                                   preset="ultrafast", bitrate=BITRATE[W], threads=2, logger=None)
+        scene_files.append(scene_mp4)
+    log("Joining scenes...")
+    # Use ffmpeg concat demuxer for frame-accurate joining (no moviepy concat drift)
+    list_file = os.path.join(tmp, "list.txt")
+    with open(list_file, "w") as f:
+        for sf in scene_files:
+            f.write(f"file '{sf}'\n")
+    run_ff(["-f", "concat", "-safe", "0", "-i", list_file,
+            "-c:v", "libx264", "-c:a", "aac", "-preset", "ultrafast",
+            "-b:v", BITRATE[W], "-movflags", "+faststart", out])
     return missed
 
 
