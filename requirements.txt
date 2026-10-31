@@ -1,7 +1,10 @@
 streamlit
-anthropic
 gTTS
 edge-tts
 requests
-moviepy==1.0.3
-opencv-python-headless
+numpy
+Pillow
+imageio-ffmpeg
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
