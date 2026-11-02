@@ -619,26 +619,40 @@ with tab_create:
 
     # Voice
     st.markdown("#### 🎙 Voice")
-    use_gemini_tts = st.toggle("Use Gemini AI voice (most realistic)", value=bool(gemini_key))
+
+    v1, v2 = st.columns(2)
+    use_gemini_tts = v1.toggle("🤖 Gemini AI voice", value=bool(gemini_key),
+                                help="Realistic AI voice — uses your Gemini API key")
+    use_gtts       = v2.toggle("🔊 gTTS / edge-tts voice", value=not bool(gemini_key),
+                                help="Free offline voice — no API key needed")
+
+    # Language picker (shared)
+    lang_pick = st.radio("Language", ["Tamil", "English", "Hindi"], horizontal=True)
+    code      = {"Tamil": "ta", "English": "en", "Hindi": "hi"}[lang_pick]
+
+    # Gemini voice picker
     if use_gemini_tts:
         if not gemini_key:
-            st.warning("Add GEMINI_API_KEY in Secrets to use Gemini voice.")
+            st.warning("⚠️ Add GEMINI_API_KEY in Secrets to use Gemini voice.")
         gemini_voice = st.selectbox("Gemini voice", GEMINI_VOICES, index=0,
-                                    help="All voices work for Tamil, English, and Hindi")
-        st.caption("⏱ Gemini TTS processes scenes one at a time (rate limit). Expect ~30s extra per scene.")
-        # Still pick edge-tts voice for fallback
-        lang_pick  = st.radio("Fallback voice language", ["Tamil","English","Hindi"], horizontal=True)
-        code       = {"Tamil":"ta","English":"en","Hindi":"hi"}[lang_pick]
-        choices    = ({k:v for k,v in load_voices().items() if v.startswith(code)}
-                      or {k:v for k,v in VOICES_FB.items() if v.startswith(code)})
-        voice_name = st.selectbox("Fallback voice", list(choices))
+                                    help="Works for Tamil, English, and Hindi")
+        st.caption("⏱ Free limit: 50 scenes/day. ~30s delay between scenes.")
     else:
         gemini_voice = "Aoede"
-        lang_pick  = st.radio("Voice language", ["Tamil","English","Hindi"], horizontal=True)
-        code       = {"Tamil":"ta","English":"en","Hindi":"hi"}[lang_pick]
-        choices    = ({k:v for k,v in load_voices().items() if v.startswith(code)}
-                      or {k:v for k,v in VOICES_FB.items() if v.startswith(code)})
+
+    # edge-tts / gTTS voice picker
+    if use_gtts:
+        choices    = ({k: v for k, v in load_voices().items() if v.startswith(code)}
+                      or {k: v for k, v in VOICES_FB.items() if v.startswith(code)})
         voice_name = st.selectbox(f"Voice ({len(choices)} available)", list(choices))
+    else:
+        # Use a sensible default voice for the selected language (for fallback only)
+        choices    = {k: v for k, v in VOICES_FB.items() if v.startswith(code)} or VOICES_FB
+        voice_name = list(choices)[0]
+
+    # If both off — force gTTS on silently
+    if not use_gemini_tts and not use_gtts:
+        use_gtts = True
 
     with st.expander("🎚 Voice modulation (edge-tts only)"):
         def apply_preset():
