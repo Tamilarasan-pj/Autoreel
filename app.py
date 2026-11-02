@@ -326,48 +326,77 @@ def _esc(s):
              .replace("]", "\\]"))
 
 
-def caption_filter(text, W, H, is_tamil=False, animated=True):
-    fp   = load_font_path(is_tamil)
-    size = max(18, int(62 * (W / 1080)))
-    bw   = max(2, int(5  * (W / 1080)))
-    y    = int(H * 0.72)
-    fa   = f":fontfile='{fp}'" if fp else ""
-
-    # Tamil: always static (complex script, ffmpeg can't animate glyphs reliably)
-    if is_tamil or not animated:
-        safe = _esc(text)
-        return (f"drawtext=text='{safe}'{fa}:fontsize={size}"
-                f":fontcolor=white:bordercolor=black:borderw={bw}"
-                f":x=(w-text_w)/2:y={y}:line_spacing=8")
-
-    # Word-by-word pop: each word highlights yellow when spoken
+def _wrap_text(text, max_chars=28):
+    """Split text into max 2 lines at a word boundary near the middle."""
     words = text.split()
     if not words:
-        return f"drawtext=text='{_esc(text)}'{fa}:fontsize={size}:fontcolor=white:x=(w-text_w)/2:y={y}"
+        return [text]
+    # If short enough, single line
+    if len(text) <= max_chars:
+        return [text]
+    # Find best split point near middle
+    mid = len(text) // 2
+    best, best_dist = 0, len(text)
+    pos = 0
+    for i, w in enumerate(words[:-1]):
+        pos += len(w) + 1
+        if abs(pos - mid) < best_dist:
+            best_dist = abs(pos - mid)
+            best = i + 1
+    line1 = " ".join(words[:best])
+    line2 = " ".join(words[best:])
+    return [line1, line2]
 
-    per_word = 1.0 / max(len(words), 1)
-    full_safe = _esc(" ".join(words))
 
-    # Dim background text — shows all words faintly from start
-    parts = [
-        f"drawtext=text='{full_safe}'{fa}:fontsize={size}"
-        f":fontcolor=0xFFFFFF66:bordercolor=black:borderw={bw}"
-        f":x=(w-text_w)/2:y={y}"
-    ]
+def caption_filter(text, W, H, is_tamil=False, animated=True):
+    fp   = load_font_path(is_tamil)
+    # Smaller font so text fits — scale down a bit more
+    size = max(16, int(52 * (W / 1080)))
+    bw   = max(2, int(4  * (W / 1080)))
+    fa   = f":fontfile='{fp}'" if fp else ""
+    margin = int(W * 0.05)   # 5% left/right margin
+    max_chars = max(20, int(W / (size * 0.55)))  # chars that fit in safe width
 
-    # Each word pops bright yellow when active
-    char_w = size * 0.54
-    for i, word in enumerate(words):
-        t0 = round(i * per_word, 3)
-        t1 = round(t0 + per_word + 0.08, 3)
-        prefix_chars = len(" ".join(words[:i])) + (1 if i > 0 else 0)
-        xpos = f"(w-text_w)/2+{int(prefix_chars * char_w)}"
+    lines = _wrap_text(text, max_chars)
+    line_h = int(size * 1.4)
+    # Position bottom line at 75% height, second line above it
+    y_bottom = int(H * 0.75)
+    ys = [y_bottom - line_h * (len(lines) - 1 - i) for i in range(len(lines))]
+
+    parts = []
+    for line, y in zip(lines, ys):
+        safe = _esc(line)
+        # Use x with margin clamp so text never goes off-screen
+        x = f"max({margin}\\,min((w-text_w)/2\\,w-text_w-{margin}))"
         parts.append(
-            f"drawtext=text='{_esc(word)}'{fa}:fontsize={int(size * 1.08)}"
-            f":fontcolor=yellow:bordercolor=black:borderw={bw}"
-            f":x={xpos}:y={y}"
-            f":enable='between(t,{t0},{t1})'"
+            f"drawtext=text='{safe}'{fa}:fontsize={size}"
+            f":fontcolor=white:bordercolor=black:borderw={bw}"
+            f":x={x}:y={y}:line_spacing=6"
         )
+
+    # For animated (English/Hindi), highlight first line words yellow
+    if animated and not is_tamil and len(lines) >= 1:
+        all_words = text.split()
+        per_word  = 1.0 / max(len(all_words), 1)
+        char_w    = size * 0.54
+        word_idx  = 0
+        for li, (line, y) in enumerate(zip(lines, ys)):
+            line_words = line.split()
+            for j, word in enumerate(line_words):
+                t0 = round(word_idx * per_word, 3)
+                t1 = round(t0 + per_word + 0.08, 3)
+                prefix_chars = len(" ".join(line_words[:j])) + (1 if j > 0 else 0)
+                line_w = len(line) * char_w
+                line_x = int((W - line_w) / 2)
+                xpos   = max(margin, line_x + int(prefix_chars * char_w))
+                parts.append(
+                    f"drawtext=text='{_esc(word)}'{fa}:fontsize={int(size * 1.06)}"
+                    f":fontcolor=yellow:bordercolor=black:borderw={bw}"
+                    f":x={xpos}:y={y}"
+                    f":enable='between(t,{t0},{t1})'"
+                )
+                word_idx += 1
+
     return ",".join(parts)
 
 
