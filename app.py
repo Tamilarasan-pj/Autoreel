@@ -160,9 +160,13 @@ def script_prompt(niche, topic, n, voice):
         f"Topic: {topic or 'pick a fresh, surprising topic'}. "
         f"Language: {lang}. Exactly {n} scenes. "
         "Scene 1 must be a strong hook that makes viewers stop scrolling. "
-        "Each scene: punchy 1-2 sentence narration with natural commas and pauses, "
-        "2-3 English stock-footage keywords (visual things like 'ocean waves'), "
-        "and an image_prompt: vivid English scene description, no text in image. "
+        "Each scene needs: "
+        "(1) punchy 1-2 sentence narration with natural pauses, "
+        "(2) keywords: 3-5 specific English Pixabay video search words that VISUALLY MATCH the narration — "
+        "be very specific, e.g. 'slow motion water droplet splash', 'aerial view city night lights', "
+        "'scientist microscope laboratory close up', 'ancient ruins stone temple jungle' — "
+        "NOT generic words like 'nature' or 'people', "
+        "(3) image_prompt: vivid cinematic English scene description for AI image generation. "
         'Return ONLY valid JSON: {"title":"...","description":"... #hashtags",'
         '"scenes":[{"narration":"...","keywords":"...","image_prompt":"..."}]}'
     )
@@ -560,10 +564,27 @@ def build(scenes, pix_key, voice, do_caps, out, log, errs,
                     errs.append(f"Ken Burns failed: {e}")
                     fitted = None
 
-        # Stock video
-        if not fitted:
-            q = s["keywords"] if s["keywords"].isascii() else "nature landscape"
-            path = fetch_pixabay(q, pix_key, tmp, used, errs, vtype, W) if pix_key else None
+        # Stock video — try keyword chain: full → first 2 words → first word → generic
+        if not fitted and pix_key:
+            raw_kw = s["keywords"] if s["keywords"].isascii() else ""
+            kw_parts = raw_kw.split() if raw_kw else []
+            candidates = []
+            if raw_kw:
+                candidates.append(raw_kw)                          # "slow motion water droplet splash"
+            if len(kw_parts) >= 2:
+                candidates.append(" ".join(kw_parts[:2]))          # "slow motion"
+            if len(kw_parts) >= 1:
+                candidates.append(kw_parts[0])                     # "slow"
+            candidates.append("nature landscape")                   # ultimate fallback
+
+            path = None
+            for q in candidates:
+                tmp_errs = []
+                path = fetch_pixabay(q, pix_key, tmp, used, tmp_errs, vtype, W)
+                if path:
+                    break
+                errs.extend(tmp_errs)
+
             if path:
                 try:
                     fitted = os.path.join(tmp, f"f{i}.mp4")
