@@ -326,6 +326,77 @@ def _esc(s):
              .replace("]", "\\]"))
 
 
+def pil_caption_overlay(text, W, H, font_path, size=52, color=(255,255,255)):
+    """Render Tamil (or any) text as a transparent PNG using Pillow+libraqm."""
+    from PIL import ImageFont
+    margin = int(W * 0.05)
+    max_w  = W - 2 * margin
+
+    try:
+        font = ImageFont.truetype(font_path, size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    # Word-wrap manually
+    words = text.split()
+    lines, cur = [], ""
+    dummy = Image.new("RGBA", (1, 1))
+    dd = ImageDraw.Draw(dummy)
+    for w in words:
+        test = (cur + " " + w).strip()
+        bbox = dd.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] <= max_w:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+
+    if not lines:
+        lines = [text]
+
+    # Measure total height
+    line_h = size + 8
+    total_h = line_h * len(lines) + 10
+    y_start = int(H * 0.72)
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    for i, line in enumerate(lines):
+        y = y_start + i * line_h
+        bbox = draw.textbbox((0, 0), line, font=font)
+        tw = bbox[2] - bbox[0]
+        x  = max(margin, (W - tw) // 2)
+        # Shadow/border
+        for dx in [-2, 0, 2]:
+            for dy in [-2, 0, 2]:
+                if dx or dy:
+                    draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 220))
+        draw.text((x, y), line, font=font, fill=color + (255,))
+
+    return img
+
+
+def apply_pil_captions(video_in, text, W, H, font_path, video_out, size=52):
+    """Burn PIL-rendered caption PNG onto video using ffmpeg overlay."""
+    import tempfile as _tf
+    png = _tf.mktemp(suffix=".png")
+    try:
+        img = pil_caption_overlay(text, W, H, font_path, size)
+        img.save(png)
+        run_ff(["-i", video_in, "-i", png,
+                "-filter_complex", "[0:v][1:v]overlay=0:0",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", "26", "-pix_fmt", "yuv420p",
+                "-an", video_out])
+    finally:
+        if os.path.exists(png):
+            os.remove(png)
+
+
 def _wrap_text(text, max_chars=28):
     """Split text into max 2 lines at a word boundary near the middle."""
     words = text.split()
@@ -523,10 +594,16 @@ def build(scenes, pix_key, voice, do_caps, out, log, errs,
 
         if do_caps:
             cap_out = os.path.join(tmp, f"cap{i}.mp4")
-            cf = caption_filter(sc["narration"], W, H, is_tamil, animated_caps)
-            run_ff(["-i", fitted, "-vf", cf, "-an",
-                    "-c:v", "libx264", "-preset", "ultrafast",
-                    "-crf", "26", "-pix_fmt", "yuv420p", cap_out])
+            if is_tamil:
+                # Use PIL for Tamil — perfect rendering of complex glyphs
+                fp = load_font_path(is_tamil=True)
+                cap_sz = max(16, int(48 * (W / 1080)))
+                apply_pil_captions(fitted, sc["narration"], W, H, fp, cap_out, cap_sz)
+            else:
+                cf = caption_filter(sc["narration"], W, H, is_tamil, animated_caps)
+                run_ff(["-i", fitted, "-vf", cf, "-an",
+                        "-c:v", "libx264", "-preset", "ultrafast",
+                        "-crf", "26", "-pix_fmt", "yuv420p", cap_out])
             vid_src = cap_out
         else:
             vid_src = fitted
