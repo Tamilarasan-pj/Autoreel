@@ -202,107 +202,55 @@ def get_script_gemini(niche, topic, n, voice, key):
                        ", ".join(errors[-5:]))
 
 
-def get_real_trends(geo="IN"):
-    """Fetch TODAY's real trending searches — tries multiple free sources."""
-    # Method 1: Google Trends RSS
-    for url in [
-        f"https://trends.google.com/trends/trendingsearches/daily/rss?geo={geo}",
-        f"https://trends.google.co.in/trends/trendingsearches/daily/rss?geo={geo}",
-    ]:
+def get_viral_topics(niche, key, lang="English", geo="IN"):
+    """Use Gemini's built-in Google Search grounding to find REAL trending topics today."""
+    if not key:
+        return [], [], "no_key"
+    key = key.strip().strip('"').strip("'")
+    country = {"IN": "India", "US": "USA", "GB": "United Kingdom"}.get(geo, geo)
+
+    # Gemini with googleSearch grounding — searches the real web from Gemini's servers
+    prompt = (
+        f"Search Google right now and find what is ACTUALLY trending in {country} today "
+        f"on YouTube Shorts, Google Trends, and social media. "
+        f"Niche: '{niche}'. The YouTube Short will be in {lang}. "
+        f"Give exactly 6 Short video ideas based on real current trending topics. "
+        f"Each must be specific, curiosity-driving, under 10 words. "
+        f"Return ONLY a valid JSON array, no other text:\n"
+        f'[{{"topic":"Short title under 10 words","trend":"the real trending topic you found","hook":"one sentence why this will go viral today"}}]'
+    )
+
+    # Models that support Google Search grounding
+    search_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+
+    for m in search_models:
         try:
-            r = requests.get(url, timeout=12, headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"})
-            if r.status_code == 200 and "<item>" in r.text:
-                titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", r.text)
-                if not titles:
-                    titles = re.findall(r"<title>(.*?)</title>", r.text)
-                result = [t.strip() for t in titles[1:21] if t.strip()]
-                if result:
-                    return result, "google_trends"
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                headers={"x-goog-api-key": key}, timeout=45,
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "tools": [{"google_search": {}}]
+                })
+            if r.status_code == 200:
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                text  = " ".join(p.get("text", "") for p in parts)
+                match = re.search(r"\[.*?\]", text, re.S)
+                if match:
+                    data = json.loads(match.group(0))
+                    if data:
+                        # Extract search queries used as "raw trends" proof
+                        raw = []
+                        try:
+                            meta = r.json()["candidates"][0].get("groundingMetadata", {})
+                            raw  = [q.get("query","") for q in
+                                    meta.get("webSearchQueries", []) or
+                                    meta.get("groundingChunks", [])]
+                        except Exception:
+                            raw = [t.get("trend","") for t in data]
+                        return data, raw, "gemini_search"
         except Exception:
             pass
-
-    # Method 2: Reddit trending (r/india or r/worldnews) via JSON API
-    subreddit = "india" if geo == "IN" else "worldnews"
-    try:
-        r = requests.get(
-            f"https://www.reddit.com/r/{subreddit}/hot.json?limit=15",
-            timeout=12, headers={"User-Agent": "AutoShortAI/1.0"})
-        if r.status_code == 200:
-            posts = r.json()["data"]["children"]
-            titles = [p["data"]["title"] for p in posts if not p["data"].get("stickied")][:12]
-            if titles:
-                return titles, "reddit"
-    except Exception:
-        pass
-
-    return [], "none"
-
-
-def get_viral_topics(niche, key, lang="English", geo="IN"):
-    """Get REAL trending topics, then use Gemini to create Short ideas from them."""
-    real_trends, source = get_real_trends(geo)
-
-    if real_trends and key:
-        # Gemini creates Short ideas from real trends
-        trends_list = "\n".join(f"- {t}" for t in real_trends[:15])
-        country = {"IN": "India", "US": "USA", "GB": "UK"}.get(geo, geo)
-        prompt = (
-            f"These are TODAY's REAL trending topics in {country} (source: {source}):\n"
-            f"{trends_list}\n\n"
-            f"Niche: '{niche}'. Short language: {lang}.\n"
-            f"Create 6 YouTube Shorts ideas inspired by these real trends.\n"
-            f"Make each idea: specific, curiosity-driving, under 10 words.\n"
-            f"Return ONLY valid JSON:\n"
-            f'[{{"topic":"Short title","trend":"original trend it is based on","hook":"why viewers will click"}}]'
-        )
-        key = key.strip().strip('"').strip("'")
-        for m in GEMINI_M:
-            try:
-                r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
-                    headers={"x-goog-api-key": key}, timeout=30,
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"responseMimeType": "application/json"}})
-                if r.status_code == 200:
-                    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    data = json.loads(re.search(r"\[.*\]", text, re.S).group(0))
-                    return data, real_trends, source
-            except Exception:
-                pass
-        # Gemini failed — return raw trends directly
-        fallback = [{"topic": t[:60], "trend": t, "hook": "Trending right now"} for t in real_trends[:6]]
-        return fallback, real_trends, source
-
-    elif key and not real_trends:
-        # Trends blocked — use Gemini with web search tool to find real trends
-        prompt = (
-            f"Search the web and find what is ACTUALLY trending on YouTube and Google in "
-            f"{'India' if geo=='IN' else geo} TODAY. "
-            f"Niche: '{niche}'. Language: {lang}. "
-            f"Give 6 real trending Short ideas with actual current events/topics. "
-            f"Return ONLY valid JSON: "
-            f'[{{"topic":"title","trend":"current event","hook":"why viral"}}]'
-        )
-        key = key.strip().strip('"').strip("'")
-        for m in GEMINI_M:
-            try:
-                r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
-                    headers={"x-goog-api-key": key}, timeout=30,
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"responseMimeType": "application/json"},
-                        "tools": [{"googleSearch": {}}]
-                    })
-                if r.status_code == 200:
-                    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    match = re.search(r"\[.*\]", text, re.S)
-                    if match:
-                        data = json.loads(match.group(0))
-                        return data, [], "gemini_search"
-            except Exception:
-                pass
 
     return [], [], "none"
 
@@ -863,16 +811,15 @@ with tab_create:
         with st.spinner("Fetching real trends…"):
             topics, raw_trends, source = get_viral_topics(vt_niche, gemini_key, vt_lang, geo_code)
             if topics:
-                src_label = {"google_trends": "✅ Google Trends",
-                             "reddit": "✅ Reddit",
-                             "gemini_search": "✅ Gemini web search",
-                             "none": "⚠️ No live data"}.get(source, source)
+                src_label = {"gemini_search": "✅ Gemini live web search",
+                             "no_key": "⚠️ No Gemini key",
+                             "none": "⚠️ Search failed"}.get(source, source)
                 st.session_state["viral_topics"]  = topics
                 st.session_state["viral_niche"]   = vt_niche
                 st.session_state["raw_trends"]    = raw_trends
                 st.session_state["trend_source"]  = src_label
             else:
-                st.error("Could not fetch trends. Try again in a minute.")
+                st.error("Could not fetch trends. Make sure GEMINI_API_KEY is set in Secrets and try again.")
 
     if st.session_state.get("raw_trends"):
         src = st.session_state.get("trend_source", "")
