@@ -202,33 +202,60 @@ def get_script_gemini(niche, topic, n, voice, key):
                        ", ".join(errors[-5:]))
 
 
-def get_viral_topics(niche, key, lang="English"):
-    """Ask Gemini for today's 6 viral YouTube Shorts topics for the given niche."""
-    prompt = (
-        f"You are a viral YouTube Shorts strategist. "
-        f"Today's date context: suggest topics that feel fresh and trending RIGHT NOW in {lang}. "
-        f"Niche: '{niche}'. "
-        f"Give me exactly 6 viral YouTube Shorts topic ideas that would get maximum views today. "
-        f"Each topic must be: specific (not generic), curiosity-driving, short (under 10 words), "
-        f"and suitable for a 30-60 second faceless Short. "
-        f"Return ONLY valid JSON: "
-        f'[{{"topic":"...","hook":"one sentence why this will go viral"}}]'
-    )
-    key = key.strip().strip('"').strip("'")
-    for m in GEMINI_M:
-        try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
-                headers={"x-goog-api-key": key}, timeout=30,
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"responseMimeType": "application/json"}})
-            if r.status_code == 200:
-                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                data = json.loads(re.search(r"\[.*\]", text, re.S).group(0))
-                return data
-        except Exception:
-            pass
-    return []
+def get_real_trends(geo="IN"):
+    """Fetch TODAY's real trending searches from Google Trends RSS — no API key needed."""
+    url = f"https://trends.google.com/trends/trendingsearches/daily/rss?geo={geo}"
+    try:
+        r = requests.get(url, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return []
+        # Parse RSS XML — extract <title> tags inside <item>
+        titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", r.text)
+        if not titles:
+            titles = re.findall(r"<title>(.*?)</title>", r.text)
+        # Skip first title (it's the feed title, not a trend)
+        return [t.strip() for t in titles[1:21] if t.strip()]
+    except Exception:
+        return []
+
+
+def get_viral_topics(niche, key, lang="English", geo="IN"):
+    """Get REAL trending topics from Google Trends, then ask Gemini to match them to the niche."""
+    # Step 1: Get real trending searches from Google
+    real_trends = get_real_trends(geo)
+
+    # Step 2: Ask Gemini to pick the best ones for this niche + create Short ideas
+    if real_trends and key:
+        trends_list = "\n".join(f"- {t}" for t in real_trends[:15])
+        prompt = (
+            f"These are TODAY's REAL trending searches on Google in {'India' if geo=='IN' else geo}:\n"
+            f"{trends_list}\n\n"
+            f"Niche: '{niche}'. Language for the Short: {lang}.\n"
+            f"Pick the 6 most relevant trends for this niche and create YouTube Shorts ideas from them.\n"
+            f"If a trend is not relevant, still create a Short idea inspired by it.\n"
+            f"Each idea must be: specific, curiosity-driving, suitable for a 30-60 second faceless Short.\n"
+            f"Return ONLY valid JSON:\n"
+            f'[{{"topic":"Short idea title (under 10 words)","trend":"the original trending search","hook":"one sentence why viewers will click"}}]'
+        )
+        key = key.strip().strip('"').strip("'")
+        for m in GEMINI_M:
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                    headers={"x-goog-api-key": key}, timeout=30,
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": {"responseMimeType": "application/json"}})
+                if r.status_code == 200:
+                    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    data = json.loads(re.search(r"\[.*\]", text, re.S).group(0))
+                    return data, real_trends
+            except Exception:
+                pass
+
+    # Fallback: just return raw trends with no Gemini processing
+    fallback = [{"topic": t, "trend": t, "hook": "Trending right now on Google"} for t in real_trends[:6]]
+    return fallback, real_trends
 
 
 def parse_manual(text):
@@ -766,8 +793,10 @@ YOUTUBE_TOKEN_JSON = '{"token":"...","refresh_token":"...",...}'
 with tab_create:
 
     # ── Viral Topics Finder ──────────────────────────────────────────────────
-    st.markdown("#### 🔥 Today's Viral Topics")
-    vt_col1, vt_col2 = st.columns([2, 1])
+    st.markdown("#### 🔥 Today's Real Trending Topics")
+    st.caption("📡 Live data from Google Trends — real searches happening right now")
+
+    vt_col1, vt_col2, vt_col3 = st.columns([2, 1, 1])
     with vt_col1:
         vt_niche = st.selectbox("Find viral topics for", NICHES + ["Other (type my own)"],
                                 key="vt_niche")
@@ -776,25 +805,34 @@ with tab_create:
                                      placeholder="e.g. Tamil history", key="vt_custom") or "Amazing facts"
     with vt_col2:
         vt_lang = st.selectbox("Language", ["Tamil", "English", "Hindi"], key="vt_lang")
+    with vt_col3:
+        vt_geo = st.selectbox("Country", ["India (IN)", "USA (US)", "UK (GB)", "Global (US)"],
+                              key="vt_geo")
+        geo_code = vt_geo.split("(")[1].replace(")", "").strip()
 
-    if st.button("🔥 Find viral topics now", use_container_width=True):
-        if not gemini_key:
-            st.error("Add GEMINI_API_KEY in Secrets to find viral topics.")
-        else:
-            with st.spinner("Searching for today's viral topics…"):
-                topics = get_viral_topics(vt_niche, gemini_key, vt_lang)
-                if topics:
-                    st.session_state["viral_topics"] = topics
-                    st.session_state["viral_niche"]  = vt_niche
-                else:
-                    st.error("Could not fetch topics. Try again.")
+    if st.button("🔥 Get today's trending topics", use_container_width=True):
+        with st.spinner("Fetching real trends from Google…"):
+            topics, raw_trends = get_viral_topics(vt_niche, gemini_key, vt_lang, geo_code)
+            if topics:
+                st.session_state["viral_topics"]  = topics
+                st.session_state["viral_niche"]   = vt_niche
+                st.session_state["raw_trends"]    = raw_trends
+            else:
+                st.error("Could not fetch trends. Check internet connection and try again.")
+
+    if st.session_state.get("raw_trends"):
+        with st.expander(f"📈 Raw Google Trends today ({len(st.session_state['raw_trends'])} trending)"):
+            for t in st.session_state["raw_trends"]:
+                st.caption(f"• {t}")
 
     if "viral_topics" in st.session_state:
-        st.markdown(f"**🎯 Viral topics for: {st.session_state.get('viral_niche','')}**")
+        st.markdown(f"**🎯 Shorts ideas from today's trends — {st.session_state.get('viral_niche','')}**")
         for i, t in enumerate(st.session_state["viral_topics"]):
             col_a, col_b = st.columns([3, 1])
             with col_a:
                 st.markdown(f"**{i+1}. {t['topic']}**")
+                if t.get("trend") and t["trend"] != t["topic"]:
+                    st.caption(f"📈 Trending: *{t['trend']}*")
                 st.caption(f"💡 {t.get('hook','')}")
             with col_b:
                 if st.button("▶ Use this", key=f"usetopic_{i}"):
