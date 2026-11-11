@@ -202,6 +202,35 @@ def get_script_gemini(niche, topic, n, voice, key):
                        ", ".join(errors[-5:]))
 
 
+def get_viral_topics(niche, key, lang="English"):
+    """Ask Gemini for today's 6 viral YouTube Shorts topics for the given niche."""
+    prompt = (
+        f"You are a viral YouTube Shorts strategist. "
+        f"Today's date context: suggest topics that feel fresh and trending RIGHT NOW in {lang}. "
+        f"Niche: '{niche}'. "
+        f"Give me exactly 6 viral YouTube Shorts topic ideas that would get maximum views today. "
+        f"Each topic must be: specific (not generic), curiosity-driving, short (under 10 words), "
+        f"and suitable for a 30-60 second faceless Short. "
+        f"Return ONLY valid JSON: "
+        f'[{{"topic":"...","hook":"one sentence why this will go viral"}}]'
+    )
+    key = key.strip().strip('"').strip("'")
+    for m in GEMINI_M:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                headers={"x-goog-api-key": key}, timeout=30,
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"responseMimeType": "application/json"}})
+            if r.status_code == 200:
+                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                data = json.loads(re.search(r"\[.*\]", text, re.S).group(0))
+                return data
+        except Exception:
+            pass
+    return []
+
+
 def parse_manual(text):
     scenes = []
     for line in text.strip().splitlines():
@@ -735,14 +764,60 @@ YOUTUBE_TOKEN_JSON = '{"token":"...","refresh_token":"...",...}'
 
 # ── CREATE TAB ────────────────────────────────────────────────────────────────
 with tab_create:
+
+    # ── Viral Topics Finder ──────────────────────────────────────────────────
+    st.markdown("#### 🔥 Today's Viral Topics")
+    vt_col1, vt_col2 = st.columns([2, 1])
+    with vt_col1:
+        vt_niche = st.selectbox("Find viral topics for", NICHES + ["Other (type my own)"],
+                                key="vt_niche")
+        if vt_niche.startswith("Other"):
+            vt_niche = st.text_input("Your niche for viral search",
+                                     placeholder="e.g. Tamil history", key="vt_custom") or "Amazing facts"
+    with vt_col2:
+        vt_lang = st.selectbox("Language", ["Tamil", "English", "Hindi"], key="vt_lang")
+
+    if st.button("🔥 Find viral topics now", use_container_width=True):
+        if not gemini_key:
+            st.error("Add GEMINI_API_KEY in Secrets to find viral topics.")
+        else:
+            with st.spinner("Searching for today's viral topics…"):
+                topics = get_viral_topics(vt_niche, gemini_key, vt_lang)
+                if topics:
+                    st.session_state["viral_topics"] = topics
+                    st.session_state["viral_niche"]  = vt_niche
+                else:
+                    st.error("Could not fetch topics. Try again.")
+
+    if "viral_topics" in st.session_state:
+        st.markdown(f"**🎯 Viral topics for: {st.session_state.get('viral_niche','')}**")
+        for i, t in enumerate(st.session_state["viral_topics"]):
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                st.markdown(f"**{i+1}. {t['topic']}**")
+                st.caption(f"💡 {t.get('hook','')}")
+            with col_b:
+                if st.button("▶ Use this", key=f"usetopic_{i}"):
+                    st.session_state["selected_topic"] = t["topic"]
+                    st.session_state["selected_niche"] = st.session_state.get("viral_niche", vt_niche)
+                    st.rerun()
+
+    if "selected_topic" in st.session_state:
+        st.success(f"✅ Selected: **{st.session_state['selected_topic']}**")
+
+    st.divider()
+
     # Niche + Topic
     c1, c2 = st.columns(2)
     with c1:
-        niche = st.selectbox("Niche", NICHES + ["Other (type my own)"])
+        default_niche_idx = (NICHES.index(st.session_state["selected_niche"])
+                             if st.session_state.get("selected_niche") in NICHES else 0)
+        niche = st.selectbox("Niche", NICHES + ["Other (type my own)"], index=default_niche_idx)
         if niche.startswith("Other"):
             niche = st.text_input("Your niche", placeholder="e.g. Tamil history") or "Amazing facts"
     with c2:
-        topic = st.text_input("Topic (optional)", placeholder="Leave empty — AI picks one")
+        topic = st.text_input("Topic", value=st.session_state.get("selected_topic", ""),
+                              placeholder="Leave empty — AI picks one")
 
     # Voice
     st.markdown("#### 🎙 Voice")
